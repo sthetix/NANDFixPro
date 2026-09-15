@@ -1,7 +1,7 @@
 # NAND Fix Pro
 
 
-[![Version](https://img.shields.io/badge/version-2.2.1-blue.svg)](https://github.com/sthetix/NANDFixPro/releases)
+[![Version](https://img.shields.io/badge/version-2.3-blue.svg)](https://github.com/sthetix/NANDFixPro/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://www.microsoft.com/windows/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -89,7 +89,7 @@ All other required tools and donor partitions are included in the release packag
 
 ### Download and Extract
 
-1. Download the `NAND-Fix-Pro-v2.2.1.exe` file from the [latest release page](https://github.com/sthetix/NANDFixPro/releases).
+1. Download the `NAND-Fix-Pro-v2.3.exe` file from the [latest release page](https://github.com/sthetix/NANDFixPro/releases).
 2. **Important**: The downloaded `.exe` file is actually a **7-Zip self-extracting archive**. When you run it or extract it, Windows Defender may flag the `NANDFixPro.exe` launcher as a potential threat.
 
 ### False Positive Warning
@@ -113,7 +113,7 @@ To use NAND Fix Pro, you'll need to add an exclusion to Windows Defender:
 4. Scroll down to **Exclusions** and click **Add or remove exclusions**
 5. Click **Add an exclusion** and select **Folder**
 6. Navigate to and select the folder where you plan to extract NAND Fix Pro
-7. Now extract the `NAND-Fix-Pro-v2.2.1.exe` to that folder
+7. Now extract the `NAND-Fix-Pro-v2.3.exe` to that folder
 
 #### Method 2: Restore Quarantined File
 
@@ -155,7 +155,7 @@ Getting started is designed to be as simple as possible.
 * Select **eMMC RAW GPP**. This makes your Switch's eMMC accessible to your computer.
 
 ### 3. Run the Tool
-* Download the `NAND-Fix-Pro-v2.2.1.exe` file from the [latest release page](https://github.com/sthetix/NANDFixPro/releases).
+* Download the `NAND-Fix-Pro-v2.3.exe` file from the [latest release page](https://github.com/sthetix/NANDFixPro/releases).
 * Run or extract the self-extracting archive to a folder on your computer.
 * Simply **double-click the `NANDFixPro.exe`** file.
 

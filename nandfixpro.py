@@ -491,6 +491,7 @@ class PRODINFOEditorDialog(tk.Toplevel):
     
     def __init__(self, parent, prodinfo_path):
         super().__init__(parent)
+        set_window_icon(self)
         self.transient(parent)
         self.title("PRODINFO Editor")
         self.parent = parent
@@ -803,6 +804,7 @@ class PRODINFOEditorDialog(tk.Toplevel):
             
             # Create a new dialog to show results
             verify_dialog = tk.Toplevel(self)
+            set_window_icon(verify_dialog)
             verify_dialog.title("PRODINFO Integrity Verification")
             verify_dialog.geometry("600x500")
             verify_dialog.configure(bg=self.parent.style.lookup('TFrame', 'background'))
@@ -865,11 +867,33 @@ import subprocess
 import re
 import configparser
 import pythoncom
+import json
+import queue
+import urllib.request
+import zipfile
+
+def set_window_icon(window):
+    """Apply the NAND Fix Pro icon to a Tk or Toplevel window."""
+    candidates = []
+    if getattr(sys, "_MEIPASS", None):
+        candidates.append(Path(sys._MEIPASS) / "images" / "icon.ico")
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "images" / "icon.ico")
+    candidates.append(Path(__file__).resolve().parent / "images" / "icon.ico")
+
+    for icon_path in candidates:
+        if icon_path.is_file():
+            try:
+                window.iconbitmap(str(icon_path))
+            except tk.TclError:
+                pass
+            return
 
 # --- CUSTOM DIALOG CLASS (Modernized) ---
 class CustomDialog(tk.Toplevel):
     def __init__(self, parent, title=None, message="", buttons="ok"):
         super().__init__(parent)
+        set_window_icon(self)
         self.transient(parent)
         self.title(title)
         self.parent = parent
@@ -877,8 +901,13 @@ class CustomDialog(tk.Toplevel):
         self.resizable(False, False)
         self.last_output_dir = None
         
-        # Apply modern theme from parent
-        self.configure(bg=parent.style.lookup('TFrame', 'background'))
+        # Apply the app theme even when this dialog belongs to another Toplevel.
+        style_owner = parent
+        while style_owner is not None and not hasattr(style_owner, "style"):
+            style_owner = getattr(style_owner, "master", None)
+        background = (style_owner.style.lookup('TFrame', 'background')
+                      if style_owner is not None else "#1c1c1c")
+        self.configure(bg=background)
 
         main_frame = ttk.Frame(self, padding="20 20 20 20", style="Dark.TFrame")
         main_frame.pack(expand=True, fill=tk.BOTH)
@@ -924,10 +953,399 @@ class CustomDialog(tk.Toplevel):
         self.result = False
         self.destroy()
 
+class FirmwareExistsDialog(tk.Toplevel):
+    """Ask how to handle a firmware version already present in the library."""
+    def __init__(self, parent, version, path):
+        super().__init__(parent)
+        set_window_icon(self)
+        self.transient(parent)
+        self.title("Firmware Already Downloaded")
+        self.result = "cancel"
+        self.resizable(False, False)
+        self.configure(bg=parent.parent.style.lookup('TFrame', 'background'))
+
+        main_frame = ttk.Frame(self, padding="20", style="Dark.TFrame")
+        main_frame.pack(expand=True, fill=tk.BOTH)
+        ttk.Label(
+            main_frame,
+            text=(f"Firmware {version} is already available in the firmware library.\n\n"
+                  f"{path}\n\nWhat would you like to do?"),
+            wraplength=460, justify=tk.LEFT, style="Dark.TLabel"
+        ).pack(anchor="w", fill="x")
+
+        button_frame = ttk.Frame(main_frame, style="Dark.TFrame")
+        button_frame.pack(pady=(18, 0))
+        ttk.Button(button_frame, text="Use Existing",
+                   command=lambda: self._finish("use"),
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=6, ipadx=8)
+        ttk.Button(button_frame, text="Download Again",
+                   command=lambda: self._finish("download"),
+                   style="TButton").pack(side=tk.LEFT, padx=6, ipadx=8)
+        ttk.Button(button_frame, text="Cancel",
+                   command=lambda: self._finish("cancel"),
+                   style="TButton").pack(side=tk.LEFT, padx=6, ipadx=8)
+
+        self.bind("<Escape>", lambda _: self._finish("cancel"))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._finish("cancel"))
+        self.grab_set()
+        self.update_idletasks()
+        parent_x, parent_y = parent.winfo_x(), parent.winfo_y()
+        parent_w, parent_h = parent.winfo_width(), parent.winfo_height()
+        self.geometry(f"+{parent_x + (parent_w - self.winfo_width()) // 2}"
+                      f"+{parent_y + (parent_h - self.winfo_height()) // 2}")
+        self.wait_window(self)
+
+    def _finish(self, result):
+        self.result = result
+        self.destroy()
+
+class FirmwareDownloadDialog(tk.Toplevel):
+    """Download and extract a firmware release from the NXFW repository."""
+    RELEASES_URL = "https://api.github.com/repos/sthetix/NXFW/releases?per_page=100"
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        set_window_icon(self)
+        self.transient(parent)
+        self.title("Download Firmware")
+        self.parent = parent
+        self.resizable(False, False)
+        self.configure(bg=parent.style.lookup('TFrame', 'background'))
+        self.cancel_event = threading.Event()
+        self.messages = queue.Queue()
+        self.releases = []
+        self.downloading = False
+        self.stale_files_checked = False
+
+        main_frame = ttk.Frame(self, padding="20", style="Dark.TFrame")
+        main_frame.pack(expand=True, fill=tk.BOTH)
+        ttk.Label(main_frame, text="Select a firmware version from sthetix/NXFW:",
+                  style="Dark.TLabel").pack(anchor="w", pady=(0, 8))
+
+        self.version_var = tk.StringVar(value="Loading releases...")
+        self.version_combo = ttk.Combobox(main_frame, textvariable=self.version_var,
+                                          state="disabled", width=42)
+        self.version_combo.pack(fill="x")
+
+        self.status_var = tk.StringVar(value="Connecting to GitHub...")
+        ttk.Label(main_frame, textvariable=self.status_var, style="Dark.TLabel",
+                  wraplength=420).pack(anchor="w", fill="x", pady=(12, 6))
+        self.progress = ttk.Progressbar(
+            main_frame, mode="indeterminate", length=420,
+            style="Download.Horizontal.TProgressbar"
+        )
+        self.progress.pack(fill="x")
+        self.progress.start(12)
+
+        button_frame = ttk.Frame(main_frame, style="Dark.TFrame")
+        button_frame.pack(pady=(16, 0))
+        self.download_button = ttk.Button(button_frame, text="Download & Use",
+                                           command=self._start_download,
+                                           style="Accent.TButton", state="disabled")
+        self.download_button.pack(side=tk.LEFT, padx=8, ipadx=10, ipady=2)
+        self.cancel_button = ttk.Button(button_frame, text="Cancel", command=self._cancel,
+                                         style="TButton")
+        self.cancel_button.pack(side=tk.LEFT, padx=8, ipadx=10, ipady=2)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+        self.update_idletasks()
+        parent_x, parent_y = parent.winfo_x(), parent.winfo_y()
+        parent_w, parent_h = parent.winfo_width(), parent.winfo_height()
+        self.geometry(f"+{parent_x + (parent_w - self.winfo_width()) // 2}"
+                      f"+{parent_y + (parent_h - self.winfo_height()) // 2}")
+        self.after(100, self._process_messages)
+        token = parent.github_token.get().strip()
+        threading.Thread(target=self._fetch_releases, args=(token,), daemon=True).start()
+
+    def _request_json(self, url, token):
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "NANDFIXPro",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+
+    def _fetch_releases(self, token):
+        try:
+            releases = self._request_json(self.RELEASES_URL, token)
+            usable = []
+            for release in releases:
+                if release.get("draft") or release.get("prerelease"):
+                    continue
+                asset = next((item for item in release.get("assets", [])
+                              if re.fullmatch(r"FW-.+\.zip", item.get("name", ""), re.IGNORECASE)), None)
+                if asset:
+                    usable.append({"version": release.get("tag_name", "Unknown"),
+                                   "asset": asset,
+                                   "latest": not usable})
+            if not usable:
+                raise RuntimeError("No FW-*.zip assets were found in the repository releases.")
+            self.messages.put(("releases", usable))
+        except Exception as exc:
+            self.messages.put(("error", f"Could not load firmware releases:\n{exc}"))
+
+    def _start_download(self):
+        selected_index = self.version_combo.current()
+        if selected_index < 0:
+            return
+        firmware_root = self._get_firmware_library()
+        if not firmware_root:
+            return
+        if not self.stale_files_checked:
+            self._offer_stale_cleanup(firmware_root)
+            self.stale_files_checked = True
+        release = self.releases[selected_index]
+        existing_dir = self._find_cached_firmware(firmware_root, release["version"])
+        if existing_dir:
+            existing_dialog = FirmwareExistsDialog(self, release["version"], existing_dir)
+            if existing_dialog.result == "cancel":
+                return
+            if existing_dialog.result == "use":
+                self.messages.put(("complete", str(existing_dir), release["version"], True))
+                return
+        self.downloading = True
+        self.download_button.config(state="disabled")
+        self.version_combo.config(state="disabled")
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=0, maximum=100)
+        threading.Thread(target=self._download_release,
+                         args=(release, firmware_root), daemon=True).start()
+
+    def _get_firmware_library(self):
+        configured = self.parent.paths["firmware_library"].get().strip()
+        firmware_root = (Path(configured) if configured
+                         else self.parent._get_app_base_path() / "firmware")
+        try:
+            firmware_root.mkdir(parents=True, exist_ok=True)
+            if not os.access(firmware_root, os.W_OK):
+                raise PermissionError(f"The folder is not writable: {firmware_root}")
+            return firmware_root
+        except OSError:
+            selected = filedialog.askdirectory(
+                parent=self,
+                title="Select a Writable Firmware Library Folder"
+            )
+            if not selected:
+                return None
+            firmware_root = Path(selected)
+            if not os.access(firmware_root, os.W_OK):
+                CustomDialog(
+                    self,
+                    title="Firmware Library",
+                    message=f"The selected folder is not writable:\n\n{firmware_root}"
+                )
+                return None
+            self.parent.paths["firmware_library"].set(str(firmware_root.resolve()))
+            self.parent._save_config()
+            return firmware_root
+
+    def _offer_stale_cleanup(self, firmware_root):
+        stale_dirs = [path for path in firmware_root.iterdir()
+                      if path.is_dir() and path.name.endswith(".extracting")]
+        downloads_dir = firmware_root / "downloads"
+        stale_files = (list(downloads_dir.glob("*.part"))
+                       if downloads_dir.is_dir() else [])
+        if not stale_dirs and not stale_files:
+            return
+
+        count = len(stale_dirs) + len(stale_files)
+        cleanup = CustomDialog(
+            self,
+            title="Incomplete Firmware Downloads",
+            message=(f"Found {count} incomplete download or extraction item(s).\n\n"
+                     "Would you like to remove these incomplete items now?"),
+            buttons="yesno"
+        )
+        if not cleanup.result:
+            return
+
+        root = firmware_root.resolve()
+        for path in stale_files:
+            resolved = path.resolve()
+            if root in resolved.parents and resolved.is_file():
+                resolved.unlink()
+        for path in stale_dirs:
+            resolved = path.resolve()
+            if root in resolved.parents and resolved.is_dir():
+                shutil.rmtree(resolved)
+
+    def _download_release(self, release, firmware_root):
+        version = release["version"]
+        asset = release["asset"]
+        try:
+            firmware_root.mkdir(parents=True, exist_ok=True)
+            final_dir = firmware_root / version
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            downloads_dir = firmware_root / "downloads"
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+            archive_path = downloads_dir / f"{asset['name']}.{timestamp}.part"
+            extract_dir = firmware_root / f"{version}.{timestamp}.extracting"
+            extract_dir.mkdir(parents=True, exist_ok=False)
+
+            download_url = asset["browser_download_url"]
+            headers = {"User-Agent": "NANDFIXPro"}
+            request = urllib.request.Request(download_url, headers=headers)
+            expected_size = int(asset.get("size") or 0)
+            digest = hashlib.sha256()
+            downloaded = 0
+            self.messages.put(("status", f"Downloading firmware {version}..."))
+            with urllib.request.urlopen(request, timeout=60) as response, open(archive_path, "wb") as output:
+                while True:
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Download cancelled. Partial files were left in the firmware cache.")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    downloaded += len(chunk)
+                    if expected_size:
+                        self.messages.put(("progress", min(downloaded * 100 / expected_size, 100)))
+
+            expected_digest = asset.get("digest", "")
+            if expected_digest.startswith("sha256:"):
+                expected_hash = expected_digest.split(":", 1)[1].lower()
+                if digest.hexdigest().lower() != expected_hash:
+                    raise RuntimeError("SHA-256 verification failed. The downloaded archive was not extracted.")
+            completed_archive = archive_path.with_suffix("")
+            archive_path.rename(completed_archive)
+
+            self.messages.put(("status", f"Extracting firmware {version}..."))
+            with zipfile.ZipFile(completed_archive) as archive:
+                root = extract_dir.resolve()
+                members = archive.infolist()
+                for member in members:
+                    destination = (extract_dir / member.filename).resolve()
+                    if destination != root and root not in destination.parents:
+                        raise RuntimeError(f"Unsafe path found in archive: {member.filename}")
+                for index, member in enumerate(members, start=1):
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Extraction cancelled. Partial files were left in the firmware cache.")
+                    archive.extract(member, extract_dir)
+                    self.messages.put(("extract_progress", index * 100 / len(members)))
+
+            nca_files = list(extract_dir.rglob("*.nca"))
+            if not nca_files:
+                raise RuntimeError("The extracted archive does not contain any NCA files.")
+            if final_dir.exists():
+                final_dir = firmware_root / f"{version}.{timestamp}"
+            extract_dir.rename(final_dir)
+            marker = {
+                "version": version,
+                "asset": asset.get("name", ""),
+                "sha256": digest.hexdigest(),
+                "downloaded_at": datetime.datetime.now().isoformat(timespec="seconds")
+            }
+            with open(final_dir / ".nandfixpro-complete.json", "w", encoding="utf-8") as marker_file:
+                json.dump(marker, marker_file, indent=2)
+            firmware_dir = self._find_firmware_dir(final_dir)
+            if not firmware_dir:
+                raise RuntimeError("Could not locate the extracted firmware folder.")
+            self.messages.put(("complete", str(firmware_dir), version, False))
+        except Exception as exc:
+            self.messages.put(("error", f"Firmware download failed:\n{exc}"))
+
+    @staticmethod
+    def _find_firmware_dir(base_dir):
+        if not base_dir.is_dir():
+            return None
+        if any(base_dir.glob("*.nca")):
+            return base_dir
+        children = [item for item in base_dir.iterdir() if item.is_dir()]
+        if len(children) == 1 and any(children[0].glob("*.nca")):
+            return children[0]
+        return base_dir if any(base_dir.rglob("*.nca")) else None
+
+    @classmethod
+    def _find_cached_firmware(cls, firmware_root, version):
+        candidates = sorted(
+            (path for path in firmware_root.iterdir()
+             if path.is_dir() and
+             (path.name == version or
+              re.fullmatch(rf"{re.escape(version)}\.\d{{8}}_\d{{6}}", path.name))),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True
+        )
+        for candidate in candidates:
+            marker_path = candidate / ".nandfixpro-complete.json"
+            if not marker_path.is_file():
+                continue
+            try:
+                with open(marker_path, "r", encoding="utf-8") as marker_file:
+                    marker = json.load(marker_file)
+                if marker.get("version") != version:
+                    continue
+            except (OSError, json.JSONDecodeError):
+                continue
+            firmware_dir = cls._find_firmware_dir(candidate)
+            if firmware_dir:
+                return firmware_dir
+        return None
+
+    def _process_messages(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                message = self.messages.get_nowait()
+                kind = message[0]
+                if kind == "releases":
+                    self.releases = message[1]
+                    values = [f"{item['version']}{' — Latest' if item['latest'] else ''}"
+                              f"  ({item['asset']['size'] / (1024 ** 2):.1f} MB)"
+                              for item in self.releases]
+                    self.version_combo.config(values=values, state="readonly")
+                    self.version_combo.current(0)
+                    self.download_button.config(state="normal")
+                    self.status_var.set("Choose a version, then click Download & Use.")
+                    self.progress.stop()
+                    self.progress.config(mode="determinate", value=0)
+                elif kind == "status":
+                    self.status_var.set(message[1])
+                elif kind == "progress":
+                    self.progress.config(value=message[1])
+                    self.status_var.set(f"Downloading... {message[1]:.1f}%")
+                elif kind == "extract_progress":
+                    self.progress.config(value=message[1])
+                    self.status_var.set(f"Extracting... {message[1]:.1f}%")
+                elif kind == "complete":
+                    path, version, reused = message[1], message[2], message[3]
+                    self.parent.paths["firmware"].set(os.path.normpath(path))
+                    self.parent._save_config()
+                    self.parent._validate_paths_and_update_buttons()
+                    self.parent._log(f"SUCCESS: Firmware {version} "
+                                     f"{'loaded from cache' if reused else 'downloaded and extracted'}: {path}")
+                    self.destroy()
+                    CustomDialog(self.parent, title="Firmware Ready",
+                                 message=f"Firmware {version} is ready and has been selected.\n\n{path}")
+                    return
+                elif kind == "error":
+                    self.destroy()
+                    CustomDialog(self.parent, title="Firmware Download", message=message[1])
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._process_messages)
+
+    def _cancel(self):
+        self.cancel_event.set()
+        if self.downloading:
+            self.status_var.set("Cancelling...")
+            self.cancel_button.config(state="disabled")
+        else:
+            self.destroy()
+
 class ConsoleTypeDialog(tk.Toplevel):
     """Dialog for selecting console type override"""
     def __init__(self, parent, current_selection=""):
         super().__init__(parent)
+        set_window_icon(self)
         self.transient(parent)
         self.title("Console Type Override")
         self.parent = parent
@@ -1013,9 +1431,9 @@ class ConsoleTypeDialog(tk.Toplevel):
 class SwitchGuiApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.iconbitmap('images/icon.ico')
+        set_window_icon(self)
         set_app_user_model_id('com.nandfixpro.app')
-        self.version = "2.2.1"
+        self.version = "2.3"
         self.title(f"NAND Fix Pro v{self.version}")
         self.geometry("860x840")
         self.minsize(760, 680)
@@ -1026,11 +1444,13 @@ class SwitchGuiApp(tk.Tk):
         self.paths = {
             "7z": tk.StringVar(), "osfmount": tk.StringVar(),
             "nxnandmanager": tk.StringVar(), "keys": tk.StringVar(), "firmware": tk.StringVar(),
+            "firmware_library": tk.StringVar(),
             "prodinfo": tk.StringVar(), "partitions_folder": tk.StringVar(),
             "output_folder": tk.StringVar(), "emmchaccgen": tk.StringVar(),
             "temp_directory": tk.StringVar(), "rawnand": tk.StringVar(),
             "output_l3": tk.StringVar(),  # Level 3 offline output folder
         }
+        self.github_token = tk.StringVar()
         
         # Offline mode toggle
         self.offline_mode = tk.BooleanVar(value=False)
@@ -1333,6 +1753,16 @@ class SwitchGuiApp(tk.Tk):
         self.style.map("Completed.TButton",
                        background=[('!disabled', self.SUCCESS_COLOR), ('active', '#0e6e0e'), ('disabled', self.BG_DARK)],
                        foreground=[('!disabled', '#ffffff'), ('disabled', self.DISABLED_FG)])
+
+        self.style.configure(
+            "Download.Horizontal.TProgressbar",
+            background=self.SUCCESS_COLOR,
+            troughcolor=self.FIELD_COLOR,
+            bordercolor=self.BORDER_COLOR,
+            lightcolor=self.SUCCESS_COLOR,
+            darkcolor=self.SUCCESS_COLOR,
+            thickness=14
+        )
 
         self.style.configure("Disabled.TButton", background=self.BG_DARK, foreground=self.DISABLED_FG)
 
@@ -1927,10 +2357,15 @@ class SwitchGuiApp(tk.Tk):
             self.offline_mode.set(offline_mode_value.lower() == 'true')
             guided_mode_seen_value = config.get('Settings', 'guided_mode_seen', fallback='False')
             self.guided_mode_seen = guided_mode_seen_value.lower() == 'true'
+            if config.has_option('Settings', 'github_token'):
+                self.github_token.set(config.get('Settings', 'github_token').strip())
+            else:
+                self.github_token.set(os.environ.get('NANDFIXPRO_GITHUB_TOKEN', ''))
             
             # Save config to clear transient paths from config.ini
             self._save_config()
         else:
+            self.github_token.set(os.environ.get('NANDFIXPRO_GITHUB_TOKEN', ''))
             self._auto_detect_paths()
             self._save_config()
 
@@ -1943,7 +2378,8 @@ class SwitchGuiApp(tk.Tk):
         }
         config['Settings'] = {
             'offline_mode': str(self.offline_mode.get()),
-            'guided_mode_seen': str(self.guided_mode_seen)
+            'guided_mode_seen': str(self.guided_mode_seen),
+            'github_token': self.github_token.get().strip()
         }
         with open(self.config_file, 'w') as configfile:
             config.write(configfile)
@@ -2168,6 +2604,7 @@ class SwitchGuiApp(tk.Tk):
 
     def _create_guided_callout(self):
         callout = tk.Toplevel(self)
+        set_window_icon(callout)
         callout.title("Guided Mode")
         callout.configure(bg=self.BG_LIGHT)
         callout.resizable(False, False)
@@ -2475,12 +2912,36 @@ class SwitchGuiApp(tk.Tk):
         )
         path_label.grid(row=row, column=1, sticky="ew", padx=5, pady=5)
         
-        browse_button = ttk.Button(parent, text="Browse...", command=lambda k=key, t=type: self._select_path(k, t), style="TButton")
+        if key == "firmware":
+            browse_button = ttk.Menubutton(parent, text="Select...", style="TButton")
+            firmware_menu = tk.Menu(
+                browse_button, tearoff=0,
+                background=self.BG_LIGHT, foreground=self.FG_COLOR,
+                activebackground=self.ACCENT_COLOR, activeforeground=self.FG_COLOR
+            )
+            firmware_menu.add_command(
+                label="Choose Local Folder...",
+                command=lambda: self._select_path("firmware", "folder")
+            )
+            firmware_menu.add_command(
+                label="Download from GitHub...",
+                command=self._open_firmware_download
+            )
+            browse_button.config(menu=firmware_menu)
+        else:
+            browse_button = ttk.Button(
+                parent, text="Browse...",
+                command=lambda k=key, t=type: self._select_path(k, t),
+                style="TButton"
+            )
         browse_button.grid(row=row, column=2, padx=5, pady=5)
         
         # NEW: Store reference to PRODINFO browse button
         if key == "prodinfo":
             self.prodinfo_browse_button = browse_button
+
+    def _open_firmware_download(self):
+        FirmwareDownloadDialog(self)
 
     def _reset_prodinfo_browse_button(self):
         """Re-enable the PRODINFO browse button and clear the path."""
@@ -3896,6 +4357,11 @@ class SwitchGuiApp(tk.Tk):
             command=self._on_offline_mode_toggle
         )
         settings_menu.add_separator()
+        settings_menu.add_command(
+            label="GitHub Access Token...",
+            command=self._show_github_token_dialog
+        )
+        settings_menu.add_separator()
 
         paths_to_show = {"7z": "7-Zip (7z.exe)...", "emmchaccgen": "EmmcHaccGen.exe...",
                             "nxnandmanager": "NxNandManager.exe...", "osfmount": "OSFMount.com...",
@@ -3904,6 +4370,68 @@ class SwitchGuiApp(tk.Tk):
         for key, text in paths_to_show.items():
             file_type = "file" if ".exe" in text or ".com" in text else "folder"
             settings_menu.add_command(label=f"Set {text}", command=lambda k=key, t=file_type: self._select_path(k, t))
+
+    def _show_github_token_dialog(self):
+        dialog = tk.Toplevel(self)
+        set_window_icon(dialog)
+        dialog.transient(self)
+        dialog.title("GitHub Access Token")
+        dialog.resizable(False, False)
+        dialog.configure(bg=self.BG_DARK)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="20", style="Dark.TFrame")
+        frame.pack(expand=True, fill=tk.BOTH)
+        ttk.Label(frame, text="GitHub Personal Access Token",
+                  font=(self.FONT_FAMILY, 11, "bold"),
+                  style="Dark.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=("Optional. A token increases GitHub API rate limits. "
+                  "Public firmware downloads continue to work without one.\n\n"
+                  "The token is stored locally in config.ini and is never written to the log."),
+            wraplength=440, justify=tk.LEFT, style="Dark.TLabel"
+        ).pack(anchor="w", fill="x", pady=(8, 12))
+
+        token_var = tk.StringVar(value=self.github_token.get())
+        token_entry = ttk.Entry(frame, textvariable=token_var, show="*", width=58)
+        token_entry.pack(fill="x")
+        token_entry.focus_set()
+
+        status_text = "A token is currently configured." if token_var.get().strip() else "No token is configured."
+        ttk.Label(frame, text=status_text, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+
+        button_frame = ttk.Frame(frame, style="Dark.TFrame")
+        button_frame.pack(pady=(18, 0))
+
+        def save_token():
+            self.github_token.set(token_var.get().strip())
+            self._save_config()
+            dialog.destroy()
+            CustomDialog(self, title="GitHub Token",
+                         message="GitHub access token saved locally.")
+
+        def clear_token():
+            self.github_token.set("")
+            self._save_config()
+            dialog.destroy()
+            CustomDialog(self, title="GitHub Token",
+                         message="GitHub access token removed.")
+
+        ttk.Button(button_frame, text="Save", command=save_token,
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=6, ipadx=10)
+        ttk.Button(button_frame, text="Clear", command=clear_token,
+                   style="TButton").pack(side=tk.LEFT, padx=6, ipadx=10)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy,
+                   style="TButton").pack(side=tk.LEFT, padx=6, ipadx=10)
+
+        dialog.bind("<Return>", lambda _: save_token())
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
 
     def _select_path(self, key, type):
         path = ""

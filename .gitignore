@@ -26,6 +26,9 @@ __pycache__/
 error_log.txt
 config.ini
 
+# Managed firmware library and downloaded archives
+firmware/
+
 # Release pack
 *.zip
 
