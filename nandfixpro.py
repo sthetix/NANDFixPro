@@ -2073,9 +2073,13 @@ class SwitchGuiApp(tk.Tk):
                     return None
 
                 size_gb = drive.get("size_gb", 0.0)
-                if size_gb and not (20.0 <= size_gb <= 70.0):
+                min_size_gb = 10.0 if "PROD_SD_GPP" in pnp_id else 20.0
+                if size_gb and not (min_size_gb <= size_gb <= 70.0):
                     self._log(f"ERROR: Target {target_drive} has unexpected size {drive.get('size')}.")
-                    self._log("ERROR: Refusing write because Switch eMMC/emuMMC targets should be roughly 32GB or 64GB.")
+                    self._log(
+                        f"ERROR: Refusing write because this Switch target should be between "
+                        f"{min_size_gb:.0f}GB and 70GB."
+                    )
                     return None
 
                 return drive
