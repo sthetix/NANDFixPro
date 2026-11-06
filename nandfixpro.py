@@ -2342,9 +2342,9 @@ class SwitchGuiApp(tk.Tk):
         self.tab_level3 = ttk.Frame(self.tab_control, padding="15")
         
         # Add tabs to notebook
-        self.tab_control.add(self.tab_level1, text='System Repair')
-        self.tab_control.add(self.tab_level2, text='Clean Install')
-        self.tab_control.add(self.tab_level3, text='NAND Reconstruction')
+        self.tab_control.add(self.tab_level1, text='A. System Repair')
+        self.tab_control.add(self.tab_level2, text='B. Clean Install')
+        self.tab_control.add(self.tab_level3, text='C. NAND Reconstruction')
         self.tab_control.bind("<<NotebookTabChanged>>", self._on_level_tab_changed)
         
         # Pack the notebook
